@@ -122,8 +122,15 @@ impl EntryViewState {
                 let terminals = tool_call.terminals().cloned().collect::<Vec<_>>();
                 let diffs = tool_call.diffs().cloned().collect::<Vec<_>>();
 
-                let views = if let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) {
-                    &mut tool_call.content
+                let is_waiting_for_input = matches!(
+                    tool_call.status,
+                    acp_thread::ToolCallStatus::WaitingForInput { .. }
+                );
+                let is_tool_call_completed =
+                    matches!(tool_call.status, acp_thread::ToolCallStatus::Completed);
+
+                let tool_call_entry = if let Some(Entry::ToolCall(tool_call_entry)) = self.entries.get_mut(index) {
+                    tool_call_entry
                 } else {
                     self.set_entry(
                         index,
@@ -131,14 +138,33 @@ impl EntryViewState {
                             content: HashMap::default(),
                         }),
                     );
-                    let Some(Entry::ToolCall(tool_call)) = self.entries.get_mut(index) else {
+                    let Some(Entry::ToolCall(tool_call_entry)) = self.entries.get_mut(index) else {
                         unreachable!()
                     };
-                    &mut tool_call.content
+                    tool_call_entry
                 };
 
-                let is_tool_call_completed =
-                    matches!(tool_call.status, acp_thread::ToolCallStatus::Completed);
+                if is_waiting_for_input {
+                    tool_call_entry
+                        .content
+                        .entry(ToolCallEntry::ask_user_editor_key())
+                        .or_insert_with(|| {
+                            cx.new(|cx| {
+                                let mut editor = editor::Editor::auto_height(1, 10, window, cx);
+                                editor.set_placeholder_text(
+                                    "Type your response here...",
+                                    window,
+                                    cx,
+                                );
+                                editor
+                            })
+                            .into_any()
+                        });
+                } else {
+                    tool_call_entry.remove_ask_user_input_editor();
+                }
+
+                let views = &mut tool_call_entry.content;
 
                 for terminal in terminals {
                     match views.entry(terminal.entity_id()) {
@@ -322,6 +348,25 @@ pub struct ToolCallEntry {
     content: HashMap<EntityId, AnyEntity>,
 }
 
+impl ToolCallEntry {
+    fn ask_user_editor_key() -> EntityId {
+        EntityId::from(u64::MAX)
+    }
+
+    pub fn ask_user_input_editor(&self) -> Option<Entity<editor::Editor>> {
+        self.content
+            .get(&Self::ask_user_editor_key())
+            .cloned()
+            .map(|entity| entity.downcast::<Editor>().unwrap())
+    }
+
+
+
+    fn remove_ask_user_input_editor(&mut self) {
+        self.content.remove(&Self::ask_user_editor_key());
+    }
+}
+
 #[derive(Debug)]
 pub enum Entry {
     UserMessage(Entity<MessageEditor>),
@@ -363,6 +408,13 @@ impl Entry {
             .map(|entity| entity.downcast::<TerminalView>().unwrap())
     }
 
+    pub fn ask_user_input_editor(&self) -> Option<Entity<Editor>> {
+        match self {
+            Self::ToolCall(tool_call_entry) => tool_call_entry.ask_user_input_editor(),
+            Self::UserMessage(_) | Self::AssistantMessage(_) | Self::CompletedPlan => None,
+        }
+    }
+
     pub fn scroll_handle_for_assistant_message_chunk(
         &self,
         chunk_ix: usize,
@@ -375,7 +427,7 @@ impl Entry {
 
     fn content_map(&self) -> Option<&HashMap<EntityId, AnyEntity>> {
         match self {
-            Self::ToolCall(ToolCallEntry { content }) => Some(content),
+            Self::ToolCall(ToolCallEntry { content, .. }) => Some(content),
             _ => None,
         }
     }
@@ -383,7 +435,7 @@ impl Entry {
     #[cfg(test)]
     pub fn has_content(&self) -> bool {
         match self {
-            Self::ToolCall(ToolCallEntry { content }) => !content.is_empty(),
+            Self::ToolCall(ToolCallEntry { content, .. }) => !content.is_empty(),
             Self::UserMessage(_) | Self::AssistantMessage(_) | Self::CompletedPlan => false,
         }
     }

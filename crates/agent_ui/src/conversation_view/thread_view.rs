@@ -1688,6 +1688,7 @@ impl ThreadView {
             matches!(
                 tool_call.status,
                 ToolCallStatus::WaitingForConfirmation { .. }
+                    | ToolCallStatus::WaitingForInput { .. }
             )
         } else {
             false
@@ -5993,7 +5994,7 @@ impl ThreadView {
 
         let needs_confirmation = matches!(
             tool_call.status,
-            ToolCallStatus::WaitingForConfirmation { .. }
+            ToolCallStatus::WaitingForConfirmation { .. } | ToolCallStatus::WaitingForInput { .. }
         );
         let is_terminal_tool = matches!(tool_call.kind, acp::ToolKind::Execute);
 
@@ -6036,6 +6037,59 @@ impl ThreadView {
 
         let tool_output_display = if is_open {
             match &tool_call.status {
+                ToolCallStatus::WaitingForInput { .. } => {
+                    let editor = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.ask_user_input_editor())
+                        .unwrap();
+
+                    v_flex()
+                        .p_2()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w_full()
+                                .p_1()
+                                .rounded_md()
+                                .bg(cx.theme().colors().editor_background)
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .child(editor.clone()),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(Button::new("cancel_input", "Cancel").on_click({
+                                    let tool_call_id = tool_call.id.clone();
+                                    cx.listener(move |this, _, _window, cx| {
+                                        this.thread.update(cx, |thread, cx| {
+                                            thread.cancel_tool_call_input(tool_call_id.clone(), cx);
+                                        });
+                                    })
+                                }))
+                                .child(
+                                    Button::new("submit_input", "Submit")
+                                        .style(ButtonStyle::Filled)
+                                        .on_click({
+                                            let tool_call_id = tool_call.id.clone();
+                                            cx.listener(move |this, _, _window, cx| {
+                                                let text = editor.read(cx).text(cx);
+                                                this.thread.update(cx, |thread, cx| {
+                                                    thread.submit_tool_call_input(
+                                                        tool_call_id.clone(),
+                                                        text,
+                                                        cx,
+                                                    );
+                                                });
+                                            })
+                                        }),
+                                ),
+                        )
+                        .into_any_element()
+                }
                 ToolCallStatus::WaitingForConfirmation { options, .. } => v_flex()
                     .w_full()
                     .children(

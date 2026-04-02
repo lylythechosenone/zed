@@ -1,5 +1,5 @@
 use crate::{
-    ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
+    AskUserTool, ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
     RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
@@ -661,6 +661,7 @@ pub enum ThreadEvent {
     ToolCallUpdate(acp_thread::ToolCallUpdate),
     Plan(acp::Plan),
     ToolCallAuthorization(ToolCallAuthorization),
+    ToolCallInputRequest(ToolCallInputRequest),
     SubagentSpawned(acp::SessionId),
     Retry(acp_thread::RetryStatus),
     Stop(acp::StopReason),
@@ -910,6 +911,12 @@ pub struct ToolCallAuthorization {
     pub options: acp_thread::PermissionOptions,
     pub response: oneshot::Sender<acp_thread::SelectedPermissionOutcome>,
     pub context: Option<ToolPermissionContext>,
+}
+
+#[derive(Debug)]
+pub struct ToolCallInputRequest {
+    pub tool_call: acp::ToolCallUpdate,
+    pub response: oneshot::Sender<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1540,6 +1547,7 @@ impl Thread {
         self.add_tool(RestoreFileFromDiskTool::new(self.project.clone()));
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
         self.add_tool(WebSearchTool);
+        self.add_tool(AskUserTool);
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment));
@@ -3596,6 +3604,23 @@ impl ToolCallEventStream {
             .update_tool_call_fields(&self.tool_use_id, fields, meta);
     }
 
+    pub fn request_input(&self) -> oneshot::Receiver<String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.stream
+            .0
+            .unbounded_send(Ok(ThreadEvent::ToolCallInputRequest(
+                ToolCallInputRequest {
+                    tool_call: acp::ToolCallUpdate::new(
+                        self.tool_use_id.to_string(),
+                        acp::ToolCallUpdateFields::new(),
+                    ),
+                    response: response_tx,
+                },
+            )))
+            .ok();
+        response_rx
+    }
+
     pub fn update_diff(&self, diff: Entity<acp_thread::Diff>) {
         self.stream
             .0
@@ -3915,6 +3940,15 @@ impl ToolCallEventStreamReceiver {
             plan
         } else {
             panic!("Expected plan but got: {:?}", event);
+        }
+    }
+
+    pub async fn expect_input_request(&mut self) -> ToolCallInputRequest {
+        let event = self.0.next().await;
+        if let Some(Ok(ThreadEvent::ToolCallInputRequest(req))) = event {
+            req
+        } else {
+            panic!("Expected ToolCallInputRequest but got: {:?}", event);
         }
     }
 }

@@ -1224,6 +1224,25 @@ impl NativeAgentConnection {
                                 })
                                 .detach();
                             }
+                            ThreadEvent::ToolCallInputRequest(
+                                crate::thread::ToolCallInputRequest {
+                                    tool_call,
+                                    response,
+                                },
+                            ) => {
+                                let input_task = acp_thread.update(cx, |thread, cx| {
+                                    thread.request_tool_call_input(tool_call, cx)
+                                })??;
+                                cx.background_spawn(async move {
+                                    if let Some(input) = input_task.await {
+                                        response
+                                            .send(input)
+                                            .map(|_| anyhow!("input receiver was dropped"))
+                                            .log_err();
+                                    }
+                                })
+                                .detach();
+                            }
                             ThreadEvent::ToolCall(tool_call) => {
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.upsert_tool_call(tool_call, cx)

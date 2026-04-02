@@ -562,6 +562,10 @@ pub enum ToolCallStatus {
         options: PermissionOptions,
         respond_tx: oneshot::Sender<SelectedPermissionOutcome>,
     },
+    /// The tool call is waiting for (text) input from the user.
+    WaitingForInput {
+        respond_tx: oneshot::Sender<String>,
+    },
     /// The tool call is currently running.
     InProgress,
     /// The tool call completed successfully.
@@ -599,6 +603,7 @@ impl Display for ToolCallStatus {
                 ToolCallStatus::Failed => "Failed",
                 ToolCallStatus::Rejected => "Rejected",
                 ToolCallStatus::Canceled => "Canceled",
+                ToolCallStatus::WaitingForInput { .. } => "Waiting for input",
             }
         )
     }
@@ -1311,7 +1316,7 @@ impl AcpThread {
             match entry {
                 AgentThreadEntry::UserMessage(_) => return false,
                 AgentThreadEntry::ToolCall(ToolCall {
-                    status: ToolCallStatus::WaitingForConfirmation { .. },
+                    status: ToolCallStatus::WaitingForConfirmation { .. } | ToolCallStatus::WaitingForInput { .. },
                     ..
                 }) => return true,
                 AgentThreadEntry::ToolCall(_)
@@ -1996,6 +2001,40 @@ impl AcpThread {
         })
         .detach();
     }
+    pub fn request_tool_call_input(
+        &mut self,
+        tool_call: acp::ToolCallUpdate,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<Option<String>>> {
+        let (tx, rx) = oneshot::channel();
+        let status = ToolCallStatus::WaitingForInput { respond_tx: tx };
+        self.upsert_tool_call_inner(tool_call, status, cx)?;
+        Ok(cx.spawn(async move |_this, _cx| rx.await.ok()))
+    }
+
+    pub fn submit_tool_call_input(
+        &mut self,
+        id: acp::ToolCallId,
+        input: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((ix, call)) = self.tool_call_mut(&id) else { return; };
+        let ToolCallStatus::WaitingForInput { respond_tx } = std::mem::replace(&mut call.status, ToolCallStatus::InProgress) else { return; };
+        let _ = respond_tx.send(input);
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+    pub fn cancel_tool_call_input(
+        &mut self,
+        id: acp::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((ix, call)) = self.tool_call_mut(&id) else { return; };
+        let ToolCallStatus::WaitingForInput { respond_tx: _ } = std::mem::replace(&mut call.status, ToolCallStatus::Canceled) else { return; };
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+
 
     pub fn request_tool_call_authorization(
         &mut self,
@@ -5182,4 +5221,93 @@ mod tests {
             "session info title update should not propagate back to the connection"
         );
     }
+
+    #[gpui::test]
+    async fn test_tool_call_input(cx: &mut TestAppContext) {
+        use std::rc::Rc;
+        init_test(cx);
+        let project = project::Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let session_id = acp::SessionId::new("1");
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let thread = cx.new(|cx| {
+            let (_, prompt_capabilities_rx) = watch::channel(acp::PromptCapabilities::default());
+            AcpThread::new(None, Some("Test".into()), None, connection, project, action_log, session_id, prompt_capabilities_rx, cx)
+        });
+
+        let tool_call_id = acp::ToolCallId::new("test_tool_call");
+        let tool_call = acp::ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            acp::ToolCallUpdateFields::new().title("test_title"),
+        );
+
+        let task = thread.update(cx, |thread, cx| {
+            thread.request_tool_call_input(tool_call, cx).unwrap()
+        });
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.is_waiting_for_confirmation());
+            let (_, call) = thread.tool_call(&tool_call_id).unwrap();
+            assert!(matches!(call.status, ToolCallStatus::WaitingForInput { .. }));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.submit_tool_call_input(tool_call_id.clone(), "test input".into(), cx);
+        });
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_waiting_for_confirmation());
+            let (_, call) = thread.tool_call(&tool_call_id).unwrap();
+            assert!(matches!(call.status, ToolCallStatus::InProgress));
+        });
+
+        assert_eq!(task.await.unwrap(), "test input");
+    }
+
+    #[gpui::test]
+    async fn test_cancel_tool_call_input(cx: &mut TestAppContext) {
+        use std::rc::Rc;
+        init_test(cx);
+        let project = project::Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let session_id = acp::SessionId::new("1");
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let thread = cx.new(|cx| {
+            let (_, prompt_capabilities_rx) = watch::channel(acp::PromptCapabilities::default());
+            AcpThread::new(None, Some("Test".into()), None, connection, project, action_log, session_id, prompt_capabilities_rx, cx)
+        });
+
+        let tool_call_id = acp::ToolCallId::new("test_tool_call");
+        let tool_call = acp::ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            acp::ToolCallUpdateFields::new().title("test_title"),
+        );
+
+        let task = thread.update(cx, |thread, cx| {
+            thread.request_tool_call_input(tool_call, cx).unwrap()
+        });
+
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel_tool_call_input(tool_call_id.clone(), cx);
+        });
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_waiting_for_confirmation());
+            let (_, call) = thread.tool_call(&tool_call_id).unwrap();
+            assert!(matches!(call.status, ToolCallStatus::Canceled));
+        });
+
+        assert_eq!(task.await, None);
+    }
+
 }
